@@ -16,14 +16,17 @@ from ..utils import ensure_dir, get_data_dir
 from ..data.jsonl_io import load_jsonl_files
 
 
-# ---------------------------------------------------------
-# 토큰 자르기 (tiktoken)
-# ---------------------------------------------------------
+# =========================
+# 1. 토큰 자르기
+# =========================
 
 _enc = tiktoken.get_encoding("cl100k_base")
 
 
 def truncate_by_tokens(text: str, max_tokens: int | None = None) -> str:
+    """
+    tiktoken 기준으로 max_tokens 까지만 남기고 잘라주는 함수.
+    """
     if max_tokens is None:
         max_tokens = EMBED_CFG.max_tokens
 
@@ -33,9 +36,9 @@ def truncate_by_tokens(text: str, max_tokens: int | None = None) -> str:
     return _enc.decode(toks[:max_tokens])
 
 
-# ---------------------------------------------------------
-# OpenAI Embedding 클라이언트
-# ---------------------------------------------------------
+# =========================
+# 2. OpenAI Embedding 클라이언트
+# =========================
 
 def _build_client() -> OpenAI:
     api_key = os.environ.get("OPENAI_API_KEY", "")
@@ -51,8 +54,17 @@ def embed_texts(
     model: str | None = None,
 ) -> np.ndarray:
     """
-    OpenAI Embeddings API 호출 헬퍼.
-    texts 전체를 한 번에 전달 (길면 바깥에서 chunking).
+    OpenAI Embeddings API 호출.
+
+    Parameters
+    ----------
+    client : OpenAI
+    texts  : str list
+    model  : 사용할 embedding 모델명 (None이면 EMBED_CFG.model_name)
+
+    Returns
+    -------
+    np.ndarray, shape (N, dim)
     """
     if model is None:
         model = EMBED_CFG.model_name
@@ -63,72 +75,44 @@ def embed_texts(
     return np.asarray(embs, dtype=np.float32)
 
 
-# ---------------------------------------------------------
-# 데이터 파일 리스트 결정
-# ---------------------------------------------------------
+# =========================
+# 3. JSONL 로드 & 전처리
+# =========================
 
 def find_default_data_files() -> List[Path]:
     """
-    기본 데이터 파일 목록을 찾는다.
+    기본 데이터 파일 목록 찾기.
 
-    1) 환경변수 EMBED_DATA_FILES 가 있으면, 세미콜론(;) 또는 콤마(,)로 구분된 경로를 사용.
-    2) 없으면 data/raw 에서 아래 파일명을 찾는다.
-       - All_Beauty.jsonl_25k_test.jsonl
-       - Baby_Products.jsonl_25k_test.jsonl
-       - Grocery_and_Gourmet_Food.jsonl_25k_test.jsonl
-       - Industrial_and_Scientific.jsonl_25k_test.jsonl
-    3) 그래도 없으면, data/raw 아래의 *.jsonl 파일 전부를 사용.
+    1) EMBED_DATA_FILES 환경변수가 있으면, 세미콜론/콤마로 구분된 경로 사용
+    2) 없으면 data/raw 아래의 *.jsonl 전부 사용
     """
-    # 1) 환경변수 우선
     env_val = os.environ.get("EMBED_DATA_FILES")
     if env_val:
         raw_paths = [x.strip() for x in env_val.replace(";", ",").split(",") if x.strip()]
         return [Path(p).expanduser().resolve() for p in raw_paths]
 
-    # 2) 기본 파일 패턴
-    cand_dir = get_data_dir("raw")
-    names = [
-        "All_Beauty.jsonl_25k_test.jsonl",
-        "Baby_Products.jsonl_25k_test.jsonl",
-        "Grocery_and_Gourmet_Food.jsonl_25k_test.jsonl",
-        "Industrial_and_Scientific.jsonl_25k_test.jsonl",
-    ]
-    paths: List[Path] = []
-    for nm in names:
-        p = cand_dir / nm
-        if p.exists():
-            paths.append(p)
-
-    if paths:
-        return paths
-
-    # 3) fallback: data/raw 아래의 모든 .jsonl
-    paths = sorted(cand_dir.glob("*.jsonl"))
+    raw_dir = get_data_dir("raw")
+    paths = sorted(raw_dir.glob("*.jsonl"))
     if not paths:
         raise FileNotFoundError(
-            f"데이터 파일을 찾을 수 없습니다. {cand_dir} 아래에 jsonl 파일을 두거나,\n"
+            f"데이터 파일을 찾을 수 없습니다. {raw_dir} 아래에 jsonl 파일을 두거나,\n"
             "환경변수 EMBED_DATA_FILES 로 경로를 지정하세요."
         )
     return paths
 
-
-# ---------------------------------------------------------
-# 메인 파이프라인
-# ---------------------------------------------------------
 
 def build_clean_records(
     max_tokens: int | None = None,
 ) -> Tuple[list[dict], list[dict]]:
     """
     JSONL 파일들을 로드해서
-    - 텍스트 토큰 길이를 제한하고
-    - group 필드(N/P/OOD)에 따라
-      PN 레코드(=N/P)와 OOD 레코드를 분리.
+    - text 토큰 길이 제한
+    - group == 'N' / 'P' / 'OOD' 기준으로 PN / OOD 분리.
 
     Returns
     -------
-    pn_records : List[dict]  (group ∈ {N, P})
-    ood_records: List[dict]  (group == OOD)
+    pn_records : group ∈ {N, P}
+    ood_records: group == OOD
     """
     data_files = find_default_data_files()
     print("[openai_embedding] 데이터 파일:")
@@ -141,7 +125,11 @@ def build_clean_records(
     cleaned: list[dict] = []
     for r in raw:
         txt = truncate_by_tokens(r["text"], max_tokens=max_tokens)
-        g = str(r["group"]).upper()
+        g_raw = r.get("group")
+        if g_raw is None:
+            # group 정보 없으면 OOD/PN 판단 불가 → 스킵
+            continue
+        g = str(g_raw).upper()
         if g not in {"N", "P", "OOD"}:
             continue
         cleaned.append({"text": txt, "group": g})
@@ -158,7 +146,7 @@ def build_train_test_split(
     test_size: float = 0.2,
 ) -> Tuple[list[dict], list[dict]]:
     """
-    PN 레코드를 train/test로 나눈다.
+    PN 레코드를 train/test로 나눈다. (stratify=group)
     """
     n = len(pn_records)
     if n == 0:
@@ -181,6 +169,10 @@ def build_train_test_split(
     )
     return train_records, test_records
 
+
+# =========================
+# 4. 임베딩 인코딩
+# =========================
 
 def encode_records(
     client: OpenAI,
@@ -207,7 +199,6 @@ def encode_records(
         embs = embed_texts(client, chunk)
         emb_list.append(embs)
 
-    # EMBED_CFG.dim 은 config에서 설정(예: 1536) 되어 있다고 가정
     X = np.vstack(emb_list) if emb_list else np.zeros((0, EMBED_CFG.dim), dtype=np.float32)
     return X, y
 
@@ -234,6 +225,56 @@ def encode_ood_records(
     return X
 
 
+# =========================
+# 5. 옛 인터페이스용 헬퍼
+# =========================
+
+def build_pn_ood_embeddings_from_jsonl(
+    test_size: float = 0.2,
+    max_tokens: int | None = None,
+    return_records: bool = False,
+):
+    """
+    (기존 코드 호환용) JSONL에서 바로 PN/OOD 임베딩을 만들어 반환.
+
+    Returns
+    -------
+    X_train, y_train, X_test, y_test, X_ood
+    (+ return_records=True 이면 레코드들도 함께 반환)
+    """
+    pn_records, ood_records = build_clean_records(
+        max_tokens=max_tokens if max_tokens is not None else EMBED_CFG.max_tokens
+    )
+    train_records, test_records = build_train_test_split(
+        pn_records,
+        test_size=test_size,
+    )
+
+    client = _build_client()
+
+    X_train, y_train = encode_records(client, train_records)
+    X_test, y_test = encode_records(client, test_records)
+    X_ood = encode_ood_records(client, ood_records)
+
+    if return_records:
+        return (
+            X_train,
+            y_train,
+            X_test,
+            y_test,
+            X_ood,
+            train_records,
+            test_records,
+            ood_records,
+        )
+    else:
+        return X_train, y_train, X_test, y_test, X_ood
+
+
+# =========================
+# 6. main() : artifacts에 .npy 저장
+# =========================
+
 def main(
     test_size: float = 0.2,
 ) -> None:
@@ -251,8 +292,8 @@ def main(
        - embeddings_test_X.npy
        - embeddings_test_y.npy
        - embeddings_ood_test_X.npy
-       - embeddings_IND_X.npy         (OOD 실험용 IND 피쳐 = test_X 복사본)
-       - embeddings_OOD_X.npy         (OOD 실험용 OOD 피쳐)
+       - embeddings_IND_X.npy
+       - embeddings_OOD_X.npy
     """
     np.random.seed(RANDOM_SEED)
     ensure_dir(ARTIFACT_DIR)
@@ -262,18 +303,15 @@ def main(
 
     client = _build_client()
 
-    # 1) PN train/test 임베딩
     print("[openai_embedding] PN(train) 임베딩 추출...")
     X_train, y_train = encode_records(client, train_records)
 
     print("[openai_embedding] PN(test) 임베딩 추출...")
     X_test, y_test = encode_records(client, test_records)
 
-    # 2) OOD 임베딩
     print("[openai_embedding] OOD 임베딩 추출...")
     X_ood = encode_ood_records(client, ood_records)
 
-    # 3) 저장
     np.save(ARTIFACT_DIR / "embeddings_train_X.npy", X_train)
     np.save(ARTIFACT_DIR / "embeddings_train_y.npy", y_train)
 
@@ -282,7 +320,7 @@ def main(
 
     np.save(ARTIFACT_DIR / "embeddings_ood_test_X.npy", X_ood)
 
-    # OOD 실험용 별도 파일명 (test IND + OOD)
+    # OOD 실험용 별도 이름
     np.save(ARTIFACT_DIR / "embeddings_IND_X.npy", X_test)
     np.save(ARTIFACT_DIR / "embeddings_OOD_X.npy", X_ood)
 
