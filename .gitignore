@@ -1,0 +1,3 @@
+*.gz
+*.jsonl
+!*_25k.jsonl
